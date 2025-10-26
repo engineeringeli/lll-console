@@ -1,26 +1,34 @@
-// lawyer-console/src/types.ts
-export interface NewContactForm {
-  firstName: string;
-  lastName: string;
-  email?: string;
-  phone?: string;
-}
+// Generic JSON shape
+export type JsonValue =
+  | string | number | boolean | null
+  | { [k: string]: JsonValue }
+  | JsonValue[];
 
-export interface Message {
+export type ApiError = { detail?: string };
+
+// Your domain models (extend as needed)
+export type Contact = {
   id: string;
-  contactId: string;
-  direction: "inbound" | "outbound";
-  channel: "sms" | "email";
+  first_name: string | null;
+  last_name: string | null;
+  email: string | null;
+  phone: string | null;
+  status: string;
+};
+
+export type ThreadMessage = {
+  id: string;
+  channel: "EMAIL" | "SMS";
+  direction: "DRAFT" | "OUTBOUND" | "INBOUND";
   body: string;
-  createdAt: string; // ISO
-  read?: boolean;
-}
+  created_at: string; // ISO
+  meta?: JsonValue;
+};
 
-export interface Contact {
-  id: string;
-  firstName: string;
-  lastName: string;
-  email?: string;
-  phone?: string;
-  status?: "new" | "active" | "closed";
-}
+export type OrgSettings = {
+  org_name?: string;
+  reply_email?: string | null;
+  reply_phone?: string | null;
+  timezone?: string;
+  // add whatever your backend returns
+};
