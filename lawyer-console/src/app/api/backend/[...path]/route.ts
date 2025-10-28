@@ -4,24 +4,23 @@ import type { NextRequest } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const API_BASE = process.env.API_BASE_URL; // server-only; set in Vercel
+const API_BASE = process.env.API_BASE_URL; // e.g. https://api.legalleadliaison.com
 
-function buildUpstreamUrl(base: string, pathSegs: string[] = [], search: string) {
+function buildUpstreamUrl(base: string, segs: string[] = [], search: string) {
   const b = base.replace(/\/+$/, "");
-  const p = pathSegs.map(encodeURIComponent).join("/");
+  const p = segs.map(encodeURIComponent).join("/");
   return `${b}/${p}${search ? `?${search}` : ""}`;
 }
 
 function pickHeaders(req: NextRequest): Headers {
   const h = new Headers();
-  // allow-list only what you truly need upstream
   const allow = new Set([
     "authorization",
     "content-type",
     "accept",
+    "cookie",
     "x-requested-with",
     "x-api-key",
-    "cookie",            // include if your backend uses cookies/sessions
     "user-agent",
     "accept-language",
     "origin",
@@ -30,20 +29,22 @@ function pickHeaders(req: NextRequest): Headers {
   req.headers.forEach((v, k) => {
     if (allow.has(k.toLowerCase())) h.set(k, v);
   });
+  // Ensure we tell upstream we want JSON if available
+  if (!h.has("accept")) h.set("accept", "application/json, */*;q=0.1");
   return h;
 }
 
 async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
-  if (!API_BASE) {
-    return new Response("API_BASE_URL env not set", { status: 500 });
-  }
+  if (!API_BASE) return new Response("API_BASE_URL env not set", { status: 500 });
 
-  const { searchParams } = new URL(req.url);
-  const target = buildUpstreamUrl(API_BASE, ctx.params.path, searchParams.toString());
+  const urlObj = new URL(req.url);
+  const dbg = urlObj.searchParams.get("__dbg") === "1"; // debug mode
+  urlObj.searchParams.delete("__dbg");
 
-  // Keep lambdas from hanging forever
+  const target = buildUpstreamUrl(API_BASE, ctx.params.path, urlObj.searchParams.toString());
+
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 15000);
+  const timer = setTimeout(() => controller.abort(), 15000);
 
   const init: RequestInit = {
     method: req.method,
@@ -56,31 +57,50 @@ async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
 
   try {
     const upstream = await fetch(target, init);
-    clearTimeout(t);
+    clearTimeout(timer);
 
-    // Buffer upstream body to avoid streaming quirks
-    const body = await upstream.arrayBuffer();
+    const buf = await upstream.arrayBuffer();
+    const textPeek = new TextDecoder().decode(buf.slice(0, 200));
+    const contentType = upstream.headers.get("content-type") || "";
 
-    // Copy headers back (skip hop-by-hop)
-    const headers = new Headers();
-    upstream.headers.forEach((v, k) => {
-      const lk = k.toLowerCase();
-      if (lk === "connection" || lk === "transfer-encoding" || lk === "content-length") return;
-      headers.set(k, v);
-    });
+    // For normal mode, mirror upstream as closely as possible.
+    if (!dbg) {
+      // Make sure content-type is set so browsers don’t “blank page” on JSON
+      const headers = new Headers();
+      upstream.headers.forEach((v, k) => {
+        const lk = k.toLowerCase();
+        if (lk === "connection" || lk === "transfer-encoding" || lk === "content-length") return;
+        headers.set(k, v);
+      });
+      if (!headers.has("content-type")) {
+        if (textPeek.trim().startsWith("{") || textPeek.trim().startsWith("[")) {
+          headers.set("content-type", "application/json; charset=utf-8");
+        } else {
+          headers.set("content-type", "text/plain; charset=utf-8");
+        }
+      }
+      headers.set("x-proxy-target", target);
+      return new Response(buf, { status: upstream.status, statusText: upstream.statusText, headers });
+    }
 
-    // Optional: helpful for debugging in Network tab
-    headers.set("x-proxy-target", target);
+    // Debug mode: wrap the upstream in a JSON envelope so you can see what's happening.
+    const debugPayload = {
+      proxy: {
+        target,
+        method: req.method,
+        status: upstream.status,
+        statusText: upstream.statusText,
+        contentType,
+        headers: Object.fromEntries(upstream.headers.entries()),
+        bodyPreview: textPeek, // first 200 chars
+      },
+    };
+    return Response.json(debugPayload, { status: upstream.status, headers: { "x-proxy-target": target } });
 
-    return new Response(body, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers,
-    });
   } catch (e) {
-    clearTimeout(t);
+    clearTimeout(timer);
     const msg = e instanceof Error ? e.message : String(e);
-    return new Response(`Proxy error to ${target}: ${msg}`, { status: 502 });
+    return new Response(`Proxy error to ${target}: ${msg}`, { status: 502, headers: { "x-proxy-target": target } });
   }
 }
 
