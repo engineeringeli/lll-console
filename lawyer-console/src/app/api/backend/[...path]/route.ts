@@ -4,7 +4,7 @@ import type { NextRequest } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const API_BASE = process.env.API_BASE_URL!; // e.g. https://api.legalleadliaison.com
+const API_BASE = process.env.API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL || "";
 
 function buildUpstreamUrl(base: string, segs: string[] = [], search: string) {
   const b = base.replace(/\/+$/, "");
@@ -42,8 +42,12 @@ async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
 
   const target = buildUpstreamUrl(API_BASE, ctx.params.path, urlObj.searchParams.toString());
 
+  // Longer timeout for writes (POST/PUT/PATCH/DELETE)
+  const isWrite = !["GET", "HEAD", "OPTIONS"].includes(req.method);
+  const timeoutMs = isWrite ? 45000 : 15000;
+
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   const init: RequestInit = {
     method: req.method,
@@ -58,9 +62,9 @@ async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
     const upstream = await fetch(target, init);
     clearTimeout(timer);
 
-    // Read the body so we can safely control headers (esp. content-encoding)
+    // Buffer response so we control headers (esp. content-encoding)
     const buf = await upstream.arrayBuffer();
-    const textPeek = new TextDecoder().decode(buf.slice(0, 200));
+    const peek = new TextDecoder().decode(buf.slice(0, 200));
     const upstreamType = upstream.headers.get("content-type") || "";
 
     if (dbg) {
@@ -73,14 +77,13 @@ async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
             statusText: upstream.statusText,
             contentType: upstreamType,
             headers: Object.fromEntries(upstream.headers.entries()),
-            bodyPreview: textPeek,
+            bodyPreview: peek,
           },
         },
         { status: upstream.status, headers: { "x-proxy-target": target } }
       );
     }
 
-    // Mirror upstream, but strip hop-by-hop + encoding headers (we already decoded)
     const headers = new Headers();
     upstream.headers.forEach((v, k) => {
       const lk = k.toLowerCase();
@@ -88,23 +91,21 @@ async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
         lk === "connection" ||
         lk === "transfer-encoding" ||
         lk === "content-length" ||
-        lk === "content-encoding" || // ← critical: drop brotli/gzip from upstream
-        lk === "vary" // optional: Vercel/runtime variance can be misleading for proxied content
-      ) {
+        lk === "content-encoding" // we already decoded if any
+      )
         return;
-      }
       headers.set(k, v);
     });
 
-    // Ensure a correct Content-Type
     if (!headers.has("content-type")) {
-      if (textPeek.trim().startsWith("{") || textPeek.trim().startsWith("[")) {
-        headers.set("content-type", "application/json; charset=utf-8");
-      } else {
-        headers.set("content-type", "text/plain; charset=utf-8");
-      }
+      const t = peek.trim();
+      headers.set(
+        "content-type",
+        t.startsWith("{") || t.startsWith("[")
+          ? "application/json; charset=utf-8"
+          : "text/plain; charset=utf-8"
+      );
     }
-    // Never set our own content-length; let platform calculate
     headers.set("x-proxy-target", target);
 
     return new Response(buf, {
