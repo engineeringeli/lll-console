@@ -1,10 +1,9 @@
-// app/api/backend/[...path]/route.ts
 import type { NextRequest } from "next/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const API_BASE = process.env.API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL || "";
+const API_BASE = process.env.API_BASE_URL!; // e.g. https://www.api.legalleadliaison.com
 
 function buildUpstreamUrl(base: string, segs: string[] = [], search: string) {
   const b = base.replace(/\/+$/, "");
@@ -33,7 +32,17 @@ function pickHeaders(req: NextRequest): Headers {
   return h;
 }
 
-async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
+async function fetchWithTimeout(url: string, init: RequestInit, ms: number) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+export async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
   if (!API_BASE) return new Response("API_BASE_URL env not set", { status: 500 });
 
   const urlObj = new URL(req.url);
@@ -42,29 +51,40 @@ async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
 
   const target = buildUpstreamUrl(API_BASE, ctx.params.path, urlObj.searchParams.toString());
 
-  // Longer timeout for writes (POST/PUT/PATCH/DELETE)
-  const isWrite = !["GET", "HEAD", "OPTIONS"].includes(req.method);
-  const timeoutMs = isWrite ? 45000 : 15000;
+  const method = req.method.toUpperCase();
+  const isWrite = !["GET", "HEAD", "OPTIONS"].includes(method);
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const ct = req.headers.get("content-type") || "";
+  const isMultipart = ct.startsWith("multipart/form-data");
+  const isJson = ct.startsWith("application/json");
+
+  // Timeouts: give uploads and writes more time
+  const timeoutMs = isMultipart ? 90_000 : isWrite ? 45_000 : 30_000;
 
   const init: RequestInit = {
-    method: req.method,
+    method,
     headers: pickHeaders(req),
-    body: ["GET", "HEAD"].includes(req.method) ? undefined : await req.arrayBuffer(),
+    body: ["GET", "HEAD"].includes(method) ? undefined : await req.arrayBuffer(),
     redirect: "follow",
     cache: "no-store",
-    signal: controller.signal,
   };
 
   try {
-    const upstream = await fetch(target, init);
-    clearTimeout(timer);
+    // one quick retry if we aborted once
+    let upstream: Response;
+    try {
+      upstream = await fetchWithTimeout(target, init, timeoutMs);
+    } catch (e: any) {
+      if (e?.name === "AbortError") {
+        upstream = await fetchWithTimeout(target, init, Math.min(timeoutMs + 30_000, 120_000));
+      } else {
+        throw e;
+      }
+    }
 
-    // Buffer response so we control headers (esp. content-encoding)
+    // Buffer so we can set correct headers (esp. strip content-encoding)
     const buf = await upstream.arrayBuffer();
-    const peek = new TextDecoder().decode(buf.slice(0, 200));
+    const textPeek = new TextDecoder().decode(buf.slice(0, 200));
     const upstreamType = upstream.headers.get("content-type") || "";
 
     if (dbg) {
@@ -72,12 +92,12 @@ async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
         {
           proxy: {
             target,
-            method: req.method,
+            method,
             status: upstream.status,
             statusText: upstream.statusText,
             contentType: upstreamType,
             headers: Object.fromEntries(upstream.headers.entries()),
-            bodyPreview: peek,
+            bodyPreview: textPeek,
           },
         },
         { status: upstream.status, headers: { "x-proxy-target": target } }
@@ -91,14 +111,14 @@ async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
         lk === "connection" ||
         lk === "transfer-encoding" ||
         lk === "content-length" ||
-        lk === "content-encoding" // we already decoded if any
-      )
-        return;
+        lk === "content-encoding"
+      ) return;
       headers.set(k, v);
     });
+    headers.set("x-proxy-target", target);
 
     if (!headers.has("content-type")) {
-      const t = peek.trim();
+      const t = textPeek.trim();
       headers.set(
         "content-type",
         t.startsWith("{") || t.startsWith("[")
@@ -106,20 +126,29 @@ async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
           : "text/plain; charset=utf-8"
       );
     }
-    headers.set("x-proxy-target", target);
 
-    return new Response(buf, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers,
-    });
-  } catch (e) {
-    clearTimeout(timer);
-    const msg = e instanceof Error ? e.message : String(e);
-    return new Response(`Proxy error to ${target}: ${msg}`, {
-      status: 502,
-      headers: { "x-proxy-target": target },
-    });
+    // If non-OK, coerce to JSON so client can .json()
+    if (!upstream.ok) {
+      let payload: any;
+      try {
+        payload = upstreamType.includes("application/json")
+          ? JSON.parse(new TextDecoder().decode(buf))
+          : { detail: new TextDecoder().decode(buf) || upstream.statusText || "Upstream error" };
+      } catch {
+        payload = { detail: "Upstream returned an unreadable body" };
+      }
+      return Response.json(
+        { proxy: { target, method, status: upstream.status, statusText: upstream.statusText }, ...payload },
+        { status: upstream.status, headers }
+      );
+    }
+
+    return new Response(buf, { status: upstream.status, statusText: upstream.statusText, headers });
+  } catch (e: any) {
+    return Response.json(
+      { detail: `Proxy error to ${target}: ${e?.message || String(e)}` },
+      { status: 502, headers: { "x-proxy-target": target } }
+    );
   }
 }
 
