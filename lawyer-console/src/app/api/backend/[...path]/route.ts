@@ -1,29 +1,31 @@
 // app/api/backend/[...path]/route.ts
-import { NextRequest, NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const API_BASE =
-  process.env.API_BASE_URL ||
-  process.env.NEXT_PUBLIC_API_BASE_URL ||
-  "http://localhost:8000"; // dev
+const API_BASE = process.env.API_BASE_URL; // server-only; set in Vercel
 
-function buildUpstreamUrl(base: string, pathSegs: string[], search: string) {
+function buildUpstreamUrl(base: string, pathSegs: string[] = [], search: string) {
   const b = base.replace(/\/+$/, "");
-  const p = (pathSegs ?? []).map(encodeURIComponent).join("/");
+  const p = pathSegs.map(encodeURIComponent).join("/");
   return `${b}/${p}${search ? `?${search}` : ""}`;
 }
 
 function pickHeaders(req: NextRequest): Headers {
   const h = new Headers();
-  // Allow-list only what the upstream actually needs
+  // allow-list only what you truly need upstream
   const allow = new Set([
     "authorization",
     "content-type",
     "accept",
     "x-requested-with",
     "x-api-key",
+    "cookie",            // include if your backend uses cookies/sessions
+    "user-agent",
+    "accept-language",
+    "origin",
+    "referer",
   ]);
   req.headers.forEach((v, k) => {
     if (allow.has(k.toLowerCase())) h.set(k, v);
@@ -31,58 +33,60 @@ function pickHeaders(req: NextRequest): Headers {
   return h;
 }
 
-async function passthrough(req: NextRequest, ctx: { params: { path: string[] } }) {
+async function handler(req: NextRequest, ctx: { params: { path: string[] } }) {
   if (!API_BASE) {
     return new Response("API_BASE_URL env not set", { status: 500 });
   }
 
   const { searchParams } = new URL(req.url);
-  const url = buildUpstreamUrl(API_BASE, ctx.params.path, searchParams.toString());
+  const target = buildUpstreamUrl(API_BASE, ctx.params.path, searchParams.toString());
 
-  // Time out slow upstreams so Vercel doesn't hold the lambda forever
+  // Keep lambdas from hanging forever
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000); // 15s
+  const t = setTimeout(() => controller.abort(), 15000);
 
   const init: RequestInit = {
     method: req.method,
     headers: pickHeaders(req),
     body: ["GET", "HEAD"].includes(req.method) ? undefined : await req.arrayBuffer(),
-    // follow 301 from api -> www.api, etc.
     redirect: "follow",
     cache: "no-store",
     signal: controller.signal,
   };
 
   try {
-    const upstream = await fetch(url, init);
-    clearTimeout(timer);
+    const upstream = await fetch(target, init);
+    clearTimeout(t);
 
-    // Stream through status and body
-    const res = new NextResponse(upstream.body, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-    });
+    // Buffer upstream body to avoid streaming quirks
+    const body = await upstream.arrayBuffer();
 
-    // Copy response headers back, skip hop-by-hop
+    // Copy headers back (skip hop-by-hop)
+    const headers = new Headers();
     upstream.headers.forEach((v, k) => {
       const lk = k.toLowerCase();
       if (lk === "connection" || lk === "transfer-encoding" || lk === "content-length") return;
-      res.headers.set(k, v);
+      headers.set(k, v);
     });
 
-    return res;
+    // Optional: helpful for debugging in Network tab
+    headers.set("x-proxy-target", target);
+
+    return new Response(body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers,
+    });
   } catch (e) {
-    clearTimeout(timer);
+    clearTimeout(t);
     const msg = e instanceof Error ? e.message : String(e);
-    // Include target URL to make Vercel logs immediately actionable
-    return new Response(`Proxy error to ${url}: ${msg}`, { status: 502 });
+    return new Response(`Proxy error to ${target}: ${msg}`, { status: 502 });
   }
 }
 
-// Same handler for all methods
-export const GET = passthrough;
-export const POST = passthrough;
-export const PUT = passthrough;
-export const PATCH = passthrough;
-export const DELETE = passthrough;
-export const OPTIONS = passthrough;
+export const GET = handler;
+export const POST = handler;
+export const PUT = handler;
+export const PATCH = handler;
+export const DELETE = handler;
+export const OPTIONS = handler;
