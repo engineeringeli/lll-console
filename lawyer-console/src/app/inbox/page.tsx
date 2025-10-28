@@ -3,7 +3,20 @@
 import { useState, useMemo, type ChangeEvent } from "react";
 import { useRouter } from "next/navigation";
 import useSWR from "swr";
-import NewContactButton from "../_components/NewContactButton"; // ← relative import
+
+import NewContactButton from "../_components/NewContactButton";
+
+type ContactWire = {
+  id: string;
+  // accept both shapes
+  first_name?: string | null;
+  last_name?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  status?: string;
+};
 
 type Contact = {
   id: string;
@@ -19,32 +32,51 @@ type ThreadMessage = {
   channel: "EMAIL" | "SMS";
   direction: "DRAFT" | "OUTBOUND" | "INBOUND";
   body: string;
-  created_at: string; // ISO string
+  created_at: string;
   meta?: unknown;
 };
 
 const base = "/api/backend";
 
-// Generic, typed fetcher that never throws a non-Error
+// Robust fetcher + console logging for visibility
 async function fetcher<T>(url: string): Promise<T> {
   const res = await fetch(url, { cache: "no-store" });
-  let data: unknown = undefined;
+  const text = await res.text();
+  let data: unknown;
   try {
-    data = await res.json();
+    data = JSON.parse(text);
   } catch {
-    // ignore non-JSON
+    console.warn("Non-JSON response from", url, text);
+    throw new Error(`Expected JSON from ${url}, got text (HTTP ${res.status})`);
   }
   if (!res.ok) {
     const detail =
       (typeof data === "object" &&
         data !== null &&
         "detail" in data &&
-        typeof (data as { detail?: string }).detail === "string" &&
-        (data as { detail: string }).detail) ||
-      `HTTP ${res.status}`;
+        typeof (data as any).detail === "string" &&
+        (data as any).detail) || `HTTP ${res.status}`;
+    console.error("Fetcher error:", url, detail, data);
     throw new Error(detail);
   }
+  console.log("Fetcher OK:", url, data);
   return data as T;
+}
+
+// Normalize snake_case | camelCase → snake_case for the UI
+function normalize(w: ContactWire): Contact {
+  const first =
+    (w.first_name ?? w.firstName ?? "") || null;
+  const last =
+    (w.last_name ?? w.lastName ?? "") || null;
+  return {
+    id: w.id,
+    first_name: first,
+    last_name: last,
+    email: (w as any).email ?? null,
+    phone: (w as any).phone ?? null,
+    status: (w as any).status ?? "NEW",
+  };
 }
 
 export default function InboxPage() {
@@ -58,17 +90,17 @@ export default function InboxPage() {
     error: swrErr,
     isLoading,
     mutate,
-  } = useSWR<Contact[]>(`${base}/contacts`, fetcher<Contact[]>, {
+  } = useSWR<ContactWire[]>(`${base}/contacts`, fetcher<ContactWire[]>, {
     refreshInterval: 5000,
     revalidateOnFocus: true,
     revalidateIfStale: true,
     dedupingInterval: 2000,
   });
 
-  const rows: Contact[] = useMemo(
-    () => (Array.isArray(data) ? data : []),
-    [data]
-  );
+  const rows: Contact[] = useMemo(() => {
+    const arr = Array.isArray(data) ? data : [];
+    return arr.map(normalize);
+  }, [data]);
 
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -91,7 +123,6 @@ export default function InboxPage() {
     router.push(`/thread/${contactId}`);
   }
 
-  // Open thread with bulk add modal; backend will create the draft on bulk-add
   function sendDocs(contactId: string) {
     router.push(`/thread/${contactId}?open=bulk`);
   }
@@ -100,35 +131,19 @@ export default function InboxPage() {
     setInfo(null);
     setError(null);
     try {
-      // 1) fetch thread to find the newest draft
       const tRes = await fetch(`${base}/messages/thread/${contactId}`, {
         cache: "no-store",
       });
-      let tj: unknown = undefined;
-      try {
-        tj = await tRes.json();
-      } catch {
-        // ignore
-      }
+      const tj = await tRes.json().catch(() => ({}));
       if (!tRes.ok) {
         const detail =
-          (typeof tj === "object" &&
-            tj !== null &&
-            "detail" in tj &&
-            typeof (tj as { detail?: string }).detail === "string" &&
-            (tj as { detail: string }).detail) ||
+          (tj && typeof tj === "object" && "detail" in tj && (tj as any).detail) ||
           `Thread HTTP ${tRes.status}`;
         throw new Error(detail);
       }
-
-      const messages: ThreadMessage[] =
-        (typeof tj === "object" &&
-          tj !== null &&
-          "messages" in tj &&
-          Array.isArray((tj as { messages: unknown }).messages) &&
-          ((tj as { messages: unknown[] }).messages as ThreadMessage[])) ||
-        [];
-
+      const messages: ThreadMessage[] = Array.isArray((tj as any).messages)
+        ? (tj as any).messages
+        : [];
       const drafts = messages.filter((m) => m.direction === "DRAFT");
       if (drafts.length === 0) {
         setInfo("No draft to approve for this contact.");
@@ -140,29 +155,19 @@ export default function InboxPage() {
       );
       const latest = drafts[0];
 
-      // 2) approve & send
       const res = await fetch(`${base}/messages/approve/${latest.id}`, {
         method: "POST",
       });
-      let body: unknown = undefined;
-      try {
-        body = await res.json();
-      } catch {
-        // ignore
-      }
+      const body = await res.json().catch(() => ({}));
       if (!res.ok) {
         const detail =
-          (typeof body === "object" &&
-            body !== null &&
-            "detail" in body &&
-            typeof (body as { detail?: string }).detail === "string" &&
-            (body as { detail: string }).detail) ||
+          (body && typeof body === "object" && "detail" in body && (body as any).detail) ||
           `Approve HTTP ${res.status}`;
         throw new Error(detail);
       }
 
       setInfo("Draft approved and enqueued to send.");
-      void mutate();
+      await mutate();
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       setError(`Approve failed: ${message}`);
@@ -175,6 +180,13 @@ export default function InboxPage() {
 
   return (
     <div className="p-6 space-y-4">
+      {/* Tiny debug chip so we can see list state at a glance */}
+      <div className="text-xs opacity-70">
+        Debug — isLoading: {String(isLoading)} • error:{" "}
+        {String((swrErr && (swrErr as Error).message) || "none")} • rows:{" "}
+        {rows.length}
+      </div>
+
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <h1 className="text-2xl font-semibold">Inbox</h1>
         <div className="flex items-center gap-2">
@@ -191,7 +203,6 @@ export default function InboxPage() {
           >
             Refresh
           </button>
-          {/* New contact (opens your modal/page, depending on your component) */}
           <NewContactButton />
         </div>
       </div>
