@@ -6,7 +6,7 @@ export const dynamic = 'force-dynamic';
 // Point this at your FastAPI base URL
 // In dev: http://localhost:8000
 // When tunneling: your NGROK URL (e.g., https://abc123.ngrok-free.app)
-const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'https://api.legalleadliaison.com';
+const BACKEND = process.env.API_BASE_URL || 'https://api.legalleadliaison.com';
 
 async function passthrough(req: NextRequest, ctx: { params: { path: string[] } }) {
   const { search } = new URL(req.url);
