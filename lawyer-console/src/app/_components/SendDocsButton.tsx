@@ -1,8 +1,6 @@
 'use client'
 
-type Props = {
-  _contactId: string; // underscore silences unused-var rule
-};
+type Props = { contactId: string }
 
 /**
  * Opens the Documents bulk-add modal in the current thread.
