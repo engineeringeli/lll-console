@@ -1,31 +1,12 @@
 "use client";
 
-import { useState, type MouseEvent } from "react";
+import { useState } from "react";
 
 type Props = {
   isOpen: boolean;
   onClose: () => void;
   onCreated?: (contactId?: string) => void;
 };
-
-type CreatedResponse = {
-  contact_id?: string;
-  id?: string;
-  contact?: { id?: string };
-  created_id?: string;
-  detail?: string;
-};
-
-// Narrow unknown JSON safely
-function parseJsonSafe<T>(value: unknown): T | undefined {
-  return (value as T) ?? undefined;
-}
-
-// Try common shapes to extract a contact id
-function extractNewId(j: CreatedResponse | undefined): string | undefined {
-  if (!j) return undefined;
-  return j.contact_id ?? j.id ?? j.contact?.id ?? j.created_id ?? undefined;
-}
 
 export default function NewContactModal({ isOpen, onClose, onCreated }: Props) {
   const [first, setFirst] = useState("");
@@ -57,33 +38,23 @@ export default function NewContactModal({ isOpen, onClose, onCreated }: Props) {
         }),
       });
 
-      // Attempt to parse JSON, but don't crash if it's empty/non-JSON
-      let parsed: CreatedResponse | undefined;
-      try {
-        const raw = (await res.json()) as unknown;
-        parsed = parseJsonSafe<CreatedResponse>(raw);
-      } catch {
-        parsed = undefined;
-      }
+      const j = await res.json().catch(() => ({} as any));
+      if (!res.ok) throw new Error(j?.detail || `HTTP ${res.status}`);
 
-      if (!res.ok) {
-        const detail = parsed?.detail ?? `HTTP ${res.status}`;
-        throw new Error(detail);
-      }
-
-      const newId = extractNewId(parsed);
+      // Try to find a contact id from common shapes
+      const newId =
+        j?.contact_id || j?.id || j?.contact?.id || j?.created_id || undefined;
 
       onClose();
       onCreated?.(newId);
-    } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : String(e);
-      setError(message);
+    } catch (e: any) {
+      setError(String(e?.message || e));
     } finally {
       setSaving(false);
     }
   }
 
-  function onBackdrop(e: MouseEvent<HTMLDivElement>) {
+  function onBackdrop(e: React.MouseEvent<HTMLDivElement>) {
     if (e.target === e.currentTarget) onClose();
   }
 
@@ -121,7 +92,6 @@ export default function NewContactModal({ isOpen, onClose, onCreated }: Props) {
             <div>
               <label className="block text-sm mb-1 text-slate-300">First name</label>
               <input
-                type="text"
                 value={first}
                 onChange={(e) => setFirst(e.target.value)}
                 className="w-full border border-slate-700 rounded px-3 py-2 bg-slate-950 text-slate-100 placeholder-slate-400 focus:outline-none focus:ring focus:ring-sky-700/40"
@@ -131,7 +101,6 @@ export default function NewContactModal({ isOpen, onClose, onCreated }: Props) {
             <div>
               <label className="block text-sm mb-1 text-slate-300">Last name</label>
               <input
-                type="text"
                 value={last}
                 onChange={(e) => setLast(e.target.value)}
                 className="w-full border border-slate-700 rounded px-3 py-2 bg-slate-950 text-slate-100 placeholder-slate-400 focus:outline-none focus:ring focus:ring-sky-700/40"
@@ -154,7 +123,6 @@ export default function NewContactModal({ isOpen, onClose, onCreated }: Props) {
             <div>
               <label className="block text-sm mb-1 text-slate-300">Phone</label>
               <input
-                type="tel"
                 value={phone}
                 onChange={(e) => setPhone(e.target.value)}
                 className="w-full border border-slate-700 rounded px-3 py-2 bg-slate-950 text-slate-100 placeholder-slate-400 focus:outline-none focus:ring focus:ring-sky-700/40"
@@ -166,7 +134,6 @@ export default function NewContactModal({ isOpen, onClose, onCreated }: Props) {
           <div>
             <label className="block text-sm mb-1 text-slate-300">Matter type</label>
             <input
-              type="text"
               value={matter}
               onChange={(e) => setMatter(e.target.value)}
               className="w-full border border-slate-700 rounded px-3 py-2 bg-slate-950 text-slate-100 placeholder-slate-400 focus:outline-none focus:ring focus:ring-sky-700/40"
